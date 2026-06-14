@@ -1,0 +1,213 @@
+import tensorflow as tf
+import numpy as np
+import cv2
+import random
+import os
+from controller import Supervisor
+import csv
+
+ALPHA = 0.6 #Learning Rate
+GAMMA = 0.9 #Discount Factor
+EPSILON = 0.0 # Exploration Rate
+Q_TABLE_FILE = "q_table.csv"
+EVALUATION_FILE = "evaluation_results.csv"
+
+
+#Q-Table File
+if os.path.exists(Q_TABLE_FILE):
+    q_table = np.loadtxt(Q_TABLE_FILE, delimiter=",")
+    print("Old Q-Table Loaded")
+else:
+    q_table = np.zeros((3, 3))
+    print("New Q-Table Created")
+
+def save_q_table():
+    np.savetxt(Q_TABLE_FILE, q_table, delimiter=",", fmt="%.2f")
+
+
+#Evaluation File
+if not os.path.exists(EVALUATION_FILE):
+    with open(EVALUATION_FILE, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Attempt', 'Success_Rate', 'Total_Reward'])
+        
+def save_evaluation(attempt, success_rate, reward):
+    with open(EVALUATION_FILE, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([attempt, f"{success_rate:.2f}", reward])       
+
+
+#Bins with the correct angles
+BIN_ANGLES = [1.85, 3.14, 2.39]
+CORRECT_BIN_INDEX = {'cardboard': 0, 'metal': 1, 'plastic': 2}
+
+#waste names
+item_names = [
+    "metal_bucket", "metal_barrel", "metal_can",
+    "plastic_bottle", "plastic_water", "plastic_box",
+    "cd_box1", "cd_box2", "cd_box3"
+]
+#Where to put the new initialize item (End of the convyeor belt)
+SPAWN_POS = [-2, 0.16, 0.36] 
+
+robot = Supervisor()
+timestep = int(robot.getBasicTimeStep())
+root = robot.getRoot()
+children_field = root.getField("children")
+
+#Item Data Preparation
+item_vrml_data = {}
+for name in item_names:
+    node = robot.getFromDef(name)
+    if node:
+        item_vrml_data[name] = node.exportString()
+    else:
+        print(f"Object Not Found")
+
+#Spawn Item Function
+def spawn_item():
+    chosen_name = random.choice(list(item_vrml_data.keys()))
+    vrml_content = item_vrml_data[chosen_name]
+    
+    children_field.importMFNodeFromString(-1, vrml_content)
+    
+    new_node = children_field.getMFNode(-1)
+    trans_field = new_node.getField("translation")
+    if trans_field:
+        trans_field.setSFVec3f(SPAWN_POS)
+
+# Load model
+try:
+    model = tf.keras.models.load_model('AI_Recycling_CNN_Model6.keras')
+    print("Model loaded Successfully")
+except Exception as e:
+    print(f"Model error: {e}")
+
+
+#Hardware Setup: Joints, Camera, Sensors
+class_names = ['cardboard', 'metal', 'plastic']
+joint_names = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
+joints = [robot.getDevice(n) for n in joint_names]
+
+#robot's arm velocity
+def set_arm_velocity(v):
+    for j in joints: 
+        if j: j.setVelocity(v)
+
+#robot's camera sensor
+camera = robot.getDevice("camera")
+if camera: 
+    camera.enable(timestep)
+    camera.recognitionEnable(timestep)
+
+#robot's distance sensor
+ds = robot.getDevice("distance_sensor")
+if ds: ds.enable(timestep)
+
+#robot's Gripper control
+f1, f2, fm = [robot.getDevice(n) for n in ["finger_1_joint_1", "finger_2_joint_1", "finger_middle_joint_1"]]
+def control_gripper(p):
+    p = max(min(p, 0.95), 0.05)
+    if f1: f1.setPosition(p); f2.setPosition(p); fm.setPosition(p)
+
+#Origin place
+def origin():
+    set_arm_velocity(3.14)
+    joints[0].setPosition(0)
+    joints[1].setPosition(0.0)
+    joints[2].setPosition(0)
+    joints[3].setPosition(0)
+    joints[4].setPosition(3.14)
+    joints[5].setPosition(0)
+    control_gripper(0.05)
+
+#Decision Making
+def choose_action(state_index):
+        return np.argmax(q_table[state_index])
+
+origin() #Start
+spawn_item() #new item initialize
+#-----------------------------------------------
+# Evaluation Variables
+total_reward = 0
+success_count = 0
+attempt_count = 0
+episode_rewards = []
+
+#main control loop
+while robot.step(timestep) != -1:
+    val = ds.getValue()
+    
+    #Perception Phase
+    if val < 450:
+        img = camera.getImage()
+        if img:
+            raw_img = np.frombuffer(img, np.uint8).reshape((camera.getHeight(), camera.getWidth(), 4))
+            res = cv2.resize(cv2.cvtColor(raw_img, cv2.COLOR_BGRA2RGB), (224, 224))
+            
+            #model prediction
+            predictions = model.predict(np.expand_dims(res, axis=0), verbose=0)[0]
+            state_index = np.argmax(predictions)
+            label = class_names[state_index]
+            
+            print(f"Detected: {label} | Picking up...")
+            
+            #choose bin (decision making)
+            chosen_bin = choose_action(state_index)
+            
+            #Action Phase (Pick and Place)
+            for n in range(80): robot.step(timestep)
+            control_gripper(0.95)
+            for n in range(40): robot.step(timestep)
+            
+            joints[1].setPosition(-1.5)
+            for n in range(30): robot.step(timestep)
+            
+            joints[0].setPosition(BIN_ANGLES[chosen_bin]) 
+            joints[1].setPosition(-0.5) 
+            joints[2].setPosition(0.8) 
+            joints[3].setPosition(-1.5) 
+            for n in range(70): robot.step(timestep) 
+            
+            
+            #Learning and Rewards
+            actual_correct_bin = CORRECT_BIN_INDEX[label]
+            if chosen_bin == actual_correct_bin:
+                reward = 1.0
+                success_count += 1
+                print(f"Reward: +1")
+
+            else:
+                reward = -1.0
+                print(f"Penalty: -1")
+
+            # Evaluation Tracking
+            total_reward += reward
+            attempt_count += 1
+            episode_rewards.append(total_reward)
+            success_rate = (success_count / attempt_count) * 100
+            save_evaluation(attempt_count, success_rate, total_reward) #update evaluation file
+            
+             #update q-table file
+            old_value = q_table[state_index, chosen_bin]
+            q_table[state_index, chosen_bin] = old_value + ALPHA * (reward + GAMMA * np.max(q_table[state_index]) - old_value)
+            save_q_table()
+            
+            #Print Evaluation Metrics
+            print(f"Success Rate: {success_rate:.2f}%")
+            print(f"Total Reward: {total_reward}")
+            print(f"Attempts: {attempt_count}")
+
+            #Reset & Return Phase
+            control_gripper(0.05)
+            for n in range(50): robot.step(timestep)
+            joints[1].setPosition(-1.6) 
+            joints[2].setPosition(-1)
+            joints[3].setPosition(-1)
+            for n in range(30): robot.step(timestep)
+            origin()
+            for n in range(100): robot.step(timestep)
+            
+            spawn_item()
+    else:
+        origin()
